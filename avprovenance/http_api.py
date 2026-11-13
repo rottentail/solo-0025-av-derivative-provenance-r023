@@ -18,8 +18,12 @@ from .validation import decode_media_payload
 
 LOGGER = logging.getLogger(__name__)
 ASSET_PATH = re.compile(r"^/v1/assets/([A-Za-z0-9_]+)$")
+PAIR_PATH = re.compile(r"^/v1/pairs/([A-Za-z0-9_]+)$")
 RENDITION_PATH = re.compile(r"^/v1/renditions/([A-Za-z0-9_]+)$")
 LINEAGE_PATH = re.compile(r"^/v1/renditions/([A-Za-z0-9_]+)/lineage$")
+PAIR_OF_RENDITION_PATH = re.compile(
+    r"^/v1/renditions/([A-Za-z0-9_]+)/pair$"
+)
 CHECK_PATH = re.compile(
     r"^/v1/renditions/([A-Za-z0-9_]+)/integrity-checks$"
 )
@@ -122,6 +126,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 return
+            pair_of_rendition_match = PAIR_OF_RENDITION_PATH.match(path)
+            if pair_of_rendition_match:
+                write_json(
+                    self,
+                    200,
+                    self.application.get_rendition_pair(
+                        pair_of_rendition_match.group(1)
+                    ),
+                    request_id=request_id,
+                )
+                return
+            pair_match = PAIR_PATH.match(path)
+            if pair_match:
+                write_json(
+                    self,
+                    200,
+                    self.application.get_pair(pair_match.group(1)),
+                    request_id=request_id,
+                )
+                return
             rendition_match = RENDITION_PATH.match(path)
             if rendition_match:
                 write_json(
@@ -165,6 +189,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             if path == "/v1/renditions":
                 body = read_json_body(self)
                 created = self.application.create_rendition(body)
+                write_json(
+                    self,
+                    201,
+                    created,
+                    request_id=request_id,
+                )
+                return
+            if path == "/v1/pairs":
+                body = read_json_body(self)
+                created = self.application.create_pair(body)
                 write_json(
                     self,
                     201,

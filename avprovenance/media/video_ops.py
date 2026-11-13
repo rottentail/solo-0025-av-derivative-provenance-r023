@@ -9,8 +9,22 @@ from .y4m import Y4mClip, Y4mFrame, decode_y4m, encode_y4m
 
 
 def trim_video(clip: Y4mClip, operation: dict[str, Any]) -> Y4mClip:
-    start = int(operation["start_frame"])
-    count = int(operation["frame_count"])
+    return trim_video_range(
+        clip,
+        int(operation["start_frame"]),
+        int(operation["frame_count"]),
+    )
+
+
+def trim_video_range(
+    clip: Y4mClip,
+    start_frame: int,
+    frame_count: int,
+) -> Y4mClip:
+    """Trim by already-quantized frame indices without re-rounding seconds."""
+
+    start = int(start_frame)
+    count = int(frame_count)
     if start < 0 or start >= clip.frame_count:
         raise MediaOperationFailure(
             "VIDEO_TRIM_OUT_OF_RANGE",
@@ -170,17 +184,10 @@ def mirror_video(clip: Y4mClip, operation: dict[str, Any]) -> Y4mClip:
     )
 
 
-def render_video(
-    primary_bytes: bytes,
+def apply_video_operations(
+    clip: Y4mClip,
     operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
-) -> bytes:
-    if secondary_bytes is not None:
-        raise MediaOperationFailure(
-            "VIDEO_SECONDARY_UNSUPPORTED",
-            "The current video operation set accepts one source.",
-        )
-    clip = decode_y4m(primary_bytes)
+) -> Y4mClip:
     try:
         for operation in operations:
             operation_type = operation["type"]
@@ -202,4 +209,18 @@ def render_video(
             "VIDEO_OPERATION_INVALID",
             "The video operation payload is malformed.",
         ) from exc
-    return encode_y4m(clip)
+    return clip
+
+
+def render_video(
+    primary_bytes: bytes,
+    operations: list[dict[str, Any]],
+    secondary_bytes: bytes | None,
+) -> bytes:
+    if secondary_bytes is not None:
+        raise MediaOperationFailure(
+            "VIDEO_SECONDARY_UNSUPPORTED",
+            "The current video operation set accepts one source.",
+        )
+    clip = decode_y4m(primary_bytes)
+    return encode_y4m(apply_video_operations(clip, operations))

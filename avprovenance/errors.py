@@ -72,6 +72,16 @@ class RenditionNotFound(ApplicationError):
         )
 
 
+class PairNotFound(ApplicationError):
+    def __init__(self, pair_id: str) -> None:
+        super().__init__(
+            code="PAIR_NOT_FOUND",
+            message="The requested media pair does not exist.",
+            status=404,
+            details={"pair_id": pair_id},
+        )
+
+
 class RenditionNotCompleted(ApplicationError):
     def __init__(self, rendition_id: str, status: str) -> None:
         super().__init__(

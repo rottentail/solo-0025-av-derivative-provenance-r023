@@ -56,7 +56,29 @@ asset, and a sequenced operation plan.
 
 Fields include the primary and secondary asset identifiers, normalized
 operations, plan digest, lifecycle status, transition history, output asset
-identifier, failure detail, and timestamps.
+identifier, failure detail, and timestamps. A rendition that belongs to a
+media pair additionally carries `pair_id`, `pair_role`, and the shared interval
+document.
+
+### Media pair
+
+One delivery of a synchronized WAV and Y4M derivative. A pair records the
+declared sync positions, the shared interval, both member renditions, both
+output assets, and its plan digest.
+
+Invariants:
+
+- A pair owns exactly one audio member and one video member.
+- A pair becomes visible only after both member outputs, both provenance edges,
+  and both completed renditions are committed together.
+- A failed pair leaves both member renditions `failed`, exposes no pair, and
+  emits no output asset or edge.
+- A pair's interval document is the single interpretation of the selected time
+  range: audio and video share the requested start and duration, and their
+  quantization is recorded separately.
+- Member start positions in the original sources are carried as exact
+  rationals, so repeated cuts on a fractional frame rate do not accumulate
+  audio/video drift.
 
 ### Provenance edge
 
@@ -164,7 +186,59 @@ Failure:
 - Processing failure records `failed` with `RENDER_FAILED` and returns a stable
   error body. No completed output edge is emitted.
 
-### 3. Verify reproduction
+### 3. Create synchronized media pair
+
+Entry point: `POST /v1/pairs`
+
+Steps:
+
+1. The HTTP boundary reads both asset identifiers, both output names, the sync
+   declaration, the shared interval, and the two member operation lists.
+2. The plan compiler validates that each member plan is valid for its media
+   kind and contains no inline `media_trim`.
+3. The application quantizes the shared interval onto each medium's grid.
+4. Both member renditions are persisted `queued` and advanced to `running`
+   together.
+5. The executor trims and applies both member plans in memory.
+6. Only after both outputs exist are the two assets, two edges, two completed
+   renditions, and the pair committed in one state mutation.
+
+Success:
+
+- Returns `201` with the pair interval, both member renditions, and both output
+  assets.
+
+Failure:
+
+- An interval outside either source returns `422 PLAN_INVALID` before any
+  member is persisted.
+- A failure on either media side records `failed` on both members and returns
+  `409 RENDER_FAILED`; no pair and no output asset are exposed.
+
+### 4. Cut an existing pair through one member
+
+Entry point: `POST /v1/renditions` with a primary asset that is a pair output.
+
+Steps:
+
+1. The application detects that the primary asset belongs to a pair and that
+   the request names a `media_trim`.
+2. The trim is interpreted on the shared interval; extra operations stay with
+   the requesting member.
+3. A new child pair is produced with the same shared cut on both members.
+
+Success:
+
+- Returns `201` with the child pair; the counterpart member advances by the
+  same interval instead of remaining at its old position.
+
+Failure:
+
+- A member request without a `media_trim` is handled as ordinary single-media
+  derivation.
+- Invalid member plans return `422 PLAN_INVALID`.
+
+### 5. Verify reproduction
 
 Entry point: `POST /v1/renditions/{rendition_id}/integrity-checks`
 
@@ -178,9 +252,13 @@ Steps:
 5. The repository persists the integrity result.
 6. The HTTP boundary returns the result.
 
+For a pair member, the verifier replays the whole pair and compares both
+recorded outputs, so one medium can never be reported verified alone.
+
 Success:
 
 - Returns `201` with `result: "verified"` and matching digests.
+- A pair check includes one per-member result entry.
 
 Failure:
 
@@ -216,7 +294,7 @@ turn into partial output.
 | `http_api` | `avprovenance/http_api.py` | HTTP routes, body limits, status mapping |
 | `application` | `avprovenance/application.py` | Use-case orchestration and public contract |
 | `validation` | `avprovenance/validation.py` | Request and operation boundary checks |
-| `media` | `avprovenance/media` | WAV/Y4M inspection and byte operations |
+| `media` | `avprovenance/media` | WAV/Y4M inspection, byte operations, and pair timeline math |
 | `renditions` | `avprovenance/renditions` | Plan normalization, execution, verification |
 | `storage` | `avprovenance/storage` | Atomic state, blobs, and repository methods |
 
@@ -237,9 +315,12 @@ outcomes without knowing HTTP details.
 - `GET /health`
 - `POST /v1/assets`
 - `GET /v1/assets/{asset_id}`
+- `POST /v1/pairs`
+- `GET /v1/pairs/{pair_id}`
 - `POST /v1/renditions`
 - `GET /v1/renditions/{rendition_id}`
 - `GET /v1/renditions/{rendition_id}/lineage`
+- `GET /v1/renditions/{rendition_id}/pair`
 - `POST /v1/renditions/{rendition_id}/integrity-checks`
 
 Every response is JSON. Errors contain `error.code`, `error.message`, and a
@@ -267,6 +348,7 @@ python3 -m compileall -q avprovenance scripts
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py pair-derivation
 ```
 
 The checks start an ephemeral HTTP server, generate bounded media bytes in

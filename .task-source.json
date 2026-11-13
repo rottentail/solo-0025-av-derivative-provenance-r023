@@ -57,6 +57,21 @@
       ]
     },
     {
+      "id": "media_pair",
+      "label": "音画配对",
+      "relations": [
+        "media_pair.links.rendition",
+        "media_pair.produces.media_asset"
+      ],
+      "invariants": [
+        "一个配对恰好包含一个音频成员和一个视频成员",
+        "配对只有在两份输出、两条谱系边和两条 completed 派生同时提交后才可见",
+        "失败的配对必须让两个成员都 failed，且不得暴露输出资产",
+        "共同区间文档是音频与视频共享的唯一解释，量化差异单独记录",
+        "成员在原始素材中的位置以精确有理数保存，重复裁切不累积漂移"
+      ]
+    },
+    {
       "id": "integrity_check",
       "label": "完整性检查",
       "relations": [
@@ -64,6 +79,7 @@
       ],
       "invariants": [
         "verified 必须同时匹配媒体描述和输出摘要",
+        "pair 成员的检查必须同时重放两份媒体，不能只验证一份",
         "mismatch 必须保留可观察原因",
         "检查结果写入后不可改写"
       ]
@@ -115,6 +131,15 @@
         "y4m_c420_probe",
         "audio_operations",
         "video_operations"
+      ],
+      "available": false
+    },
+    {
+      "family": "音画同步与配对",
+      "occupied_by": [
+        "exact_rational_timeline",
+        "paired_member_atomic_commit",
+        "member_initiated_pair_cut"
       ],
       "available": false
     },
@@ -183,6 +208,11 @@
       "workflow_id": "verify-reproduction",
       "description": "重放可证明字节一致，但任何输入替换、配方漂移或输出缺失都必须转为 mismatch 而不是静默通过",
       "observable_failure": "不同摘要被标记 verified，或检查失败后未持久化 mismatch 原因"
+    },
+    {
+      "workflow_id": "pair-derivation",
+      "description": "配对必须在同一精确时间轴上量化两份媒体，并在任一份失败时整体失败；从成员裁切时对端必须同步前进而不能停在原位置",
+      "observable_failure": "只出现一份 completed 媒体，或对端视频仍停留在裁切前的位置，或分数帧率下多次裁切后音画相对位置持续漂移"
     }
   ]
 }

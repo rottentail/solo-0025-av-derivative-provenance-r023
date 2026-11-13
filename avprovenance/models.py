@@ -95,6 +95,9 @@ class Rendition:
     error_message: str | None
     created_at: str
     updated_at: str
+    pair_id: str | None = None
+    pair_role: str | None = None
+    interval: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +114,9 @@ class Rendition:
             "error_message": self.error_message,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "pair_id": self.pair_id,
+            "pair_role": self.pair_role,
+            "interval": deep_copy(self.interval),
         }
 
     @classmethod
@@ -141,6 +147,15 @@ class Rendition:
             ),
             created_at=str(value["created_at"]),
             updated_at=str(value["updated_at"]),
+            pair_id=(
+                str(value["pair_id"]) if value.get("pair_id") is not None else None
+            ),
+            pair_role=(
+                str(value["pair_role"])
+                if value.get("pair_role") is not None
+                else None
+            ),
+            interval=deep_copy(value.get("interval")),
         )
 
     def transition_to(self, target: str) -> None:
@@ -207,6 +222,7 @@ class IntegrityAudit:
     reason: str | None
     created_at: str
     updated_at: str
+    members: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -220,6 +236,7 @@ class IntegrityAudit:
             "reason": self.reason,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "members": deep_copy(self.members),
         }
 
     @classmethod
@@ -245,6 +262,7 @@ class IntegrityAudit:
             ),
             created_at=str(value["created_at"]),
             updated_at=str(value["updated_at"]),
+            members=deep_copy(list(value.get("members") or [])),
         )
 
     def finish(
@@ -256,6 +274,7 @@ class IntegrityAudit:
         expected_descriptor: dict[str, Any] | None,
         reproduced_descriptor: dict[str, Any] | None,
         reason: str | None,
+        members: list[dict[str, Any]] | None = None,
     ) -> None:
         if self.status in TERMINAL_CHECK_STATES:
             raise InvalidStateTransition(self.status, status)
@@ -267,4 +286,77 @@ class IntegrityAudit:
         self.expected_descriptor = deep_copy(expected_descriptor)
         self.reproduced_descriptor = deep_copy(reproduced_descriptor)
         self.reason = reason
+        self.members = deep_copy(list(members or []))
         self.updated_at = utc_now()
+
+
+PAIR_MEMBER_ROLES = {"audio", "video"}
+
+
+@dataclass
+class MediaPair:
+    """One delivery of a synchronized WAV and Y4M derivative.
+
+    A pair owns the shared interval and exactly two member renditions.  It is
+    only committed once both member outputs exist, so a pair can never expose
+    a single successful medium.
+    """
+
+    id: str
+    audio_rendition_id: str
+    video_rendition_id: str
+    audio_output_asset_id: str
+    video_output_asset_id: str
+    audio_parent_asset_id: str
+    video_parent_asset_id: str
+    interval: dict[str, Any]
+    audio_operations: list[dict[str, Any]]
+    video_operations: list[dict[str, Any]]
+    plan_digest: str
+    parent_pair_id: str | None
+    status: str
+    created_at: str
+    updated_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "audio_rendition_id": self.audio_rendition_id,
+            "video_rendition_id": self.video_rendition_id,
+            "audio_output_asset_id": self.audio_output_asset_id,
+            "video_output_asset_id": self.video_output_asset_id,
+            "audio_parent_asset_id": self.audio_parent_asset_id,
+            "video_parent_asset_id": self.video_parent_asset_id,
+            "interval": deep_copy(self.interval),
+            "audio_operations": deep_copy(self.audio_operations),
+            "video_operations": deep_copy(self.video_operations),
+            "plan_digest": self.plan_digest,
+            "parent_pair_id": self.parent_pair_id,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "MediaPair":
+        return cls(
+            id=str(value["id"]),
+            audio_rendition_id=str(value["audio_rendition_id"]),
+            video_rendition_id=str(value["video_rendition_id"]),
+            audio_output_asset_id=str(value["audio_output_asset_id"]),
+            video_output_asset_id=str(value["video_output_asset_id"]),
+            audio_parent_asset_id=str(value["audio_parent_asset_id"]),
+            video_parent_asset_id=str(value["video_parent_asset_id"]),
+            interval=deep_copy(dict(value["interval"])),
+            audio_operations=deep_copy(list(value.get("audio_operations") or [])),
+            video_operations=deep_copy(list(value.get("video_operations") or [])),
+            plan_digest=str(value["plan_digest"]),
+            parent_pair_id=(
+                str(value["parent_pair_id"])
+                if value.get("parent_pair_id") is not None
+                else None
+            ),
+            status=str(value.get("status", "completed")),
+            created_at=str(value["created_at"]),
+            updated_at=str(value["updated_at"]),
+        )

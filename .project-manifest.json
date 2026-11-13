@@ -99,7 +99,7 @@
       "entry": "POST /v1/renditions/{rendition_id}/integrity-checks",
       "steps": [
         "load the completed rendition and provenance edge",
-        "reload parent bytes and replay the stored plan",
+        "reload parent bytes and replay",
         "compare output digest and descriptor",
         "persist verified or mismatch result"
       ],
@@ -108,6 +108,29 @@
       "verification": "The workflow check renders Y4M media, verifies reproduction, and inspects lineage",
       "module_ids": [
         "http_api",
+        "application",
+        "renditions",
+        "media",
+        "storage"
+      ]
+    },
+    {
+      "id": "pair-derivation",
+      "name": "Derive synchronized media pair",
+      "entry": "POST /v1/pairs",
+      "steps": [
+        "validate both assets, sync declaration, shared interval, and member plans",
+        "quantize the shared interval on the audio and video grids as exact rationals",
+        "persist both member renditions queued and advance them to running together",
+        "render both members in memory",
+        "commit both outputs, both edges, both completed renditions, and the pair in one mutation"
+      ],
+      "success": "Returns a completed pair with one independently readable WAV and Y4M and a shared interval document",
+      "failure": "Records failed on both members with a stable error code and exposes neither output nor a pair record",
+      "verification": "The workflow check creates a pair at a fractional frame rate, cuts it repeatedly through one member, verifies both members together, and confirms both members fail together",
+      "module_ids": [
+        "http_api",
+        "validation",
         "application",
         "renditions",
         "media",

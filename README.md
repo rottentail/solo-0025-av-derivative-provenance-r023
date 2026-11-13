@@ -14,10 +14,13 @@ FFmpeg, network access, credentials, or an online database.
 - Ingests planar 4:2:0 YUV4MPEG2 in the `C420` family.
 - Applies audio trim, gain, normalization, and two-source mixing.
 - Applies video trim, even-aligned crop, luma offset, and horizontal mirror.
-- Persists immutable assets, rendition state, provenance edges, and integrity
-  checks.
+- Delivers paired WAV/Y4M derivatives under one declared sync point and shared
+  interval, with exact rational timing that does not drift across repeated
+  cuts.
+- Persists immutable assets, rendition state, provenance edges, media pairs,
+  and integrity checks.
 - Replays the stored operation plan and compares both bytes and media
-  descriptors.
+  descriptors; pair checks replay both members together.
 
 ## Quick start
 
@@ -48,6 +51,66 @@ Content-Type: application/json
   "data_base64": "<strict base64>"
 }
 ```
+
+### Create a synchronized pair
+
+```http
+POST /v1/pairs
+Content-Type: application/json
+
+{
+  "audio_asset_id": "asset_...",
+  "video_asset_id": "asset_...",
+  "audio_output_name": "delivery.wav",
+  "video_output_name": "delivery.y4m",
+  "sync": {"audio_seconds": 0.0, "video_seconds": 0.0},
+  "interval": {"start_seconds": 0.5, "duration_seconds": 2.0},
+  "operations": {
+    "audio": [{"type": "audio_gain", "db": -3}],
+    "video": [{"type": "video_luma_offset", "amount": 7}]
+  }
+}
+```
+
+`sync` states which position in each source lines up at pair time zero;
+`interval` is the shared playback range relative to that alignment. Both
+outputs are produced before anything is committed, so a failed pair returns
+`409 RENDER_FAILED` with both member renditions `failed` and no visible
+delivery. The response `interval` block is the single interpretation of the
+range: `start_seconds` and `duration_seconds` are shared, while
+`members.audio`/`members.video` record the delivered sample or frame
+positions. Fractional frame rates are handled as exact rationals, so the
+audio/video offset stays within half a sample and one frame no matter how
+many times a delivery is cut.
+
+### Read a pair
+
+```http
+GET /v1/pairs/{pair_id}
+GET /v1/renditions/{rendition_id}/pair
+```
+
+### Cut a pair through either member
+
+Pass a pair output asset as `primary_asset_id` and include a `media_trim`. The
+same shared interval is applied to both members, so the counterpart advances
+with the requesting one instead of staying at its old position:
+
+```json
+{
+  "primary_asset_id": "asset_from_pair_wav",
+  "output_name": "child.wav",
+  "operations": [
+    {"type": "media_trim", "start_seconds": 0.2, "duration_seconds": 0.5},
+    {"type": "audio_gain", "db": -2}
+  ]
+}
+```
+
+For a video member, name the trim in frames (`start_frame`, `frame_count`).
+Extra operations apply only to the requesting member. The counterpart output
+name may be supplied as `counterpart_output_name`. A request without
+`media_trim` is treated as ordinary single-media derivation.
 
 ### Read an asset
 
@@ -117,7 +180,9 @@ Content-Type: application/json
 
 The successful response has `status: "verified"`. A byte or descriptor
 difference returns HTTP `409` with code `INTEGRITY_MISMATCH`; the mismatch
-record remains durable.
+record remains durable. When the rendition belongs to a pair, the check
+replays both members and returns one `verified`/`mismatch` entry per member, so
+a single medium can never be reported verified on its own.
 
 ## Media operation examples
 
@@ -196,6 +261,7 @@ current production workflow checks are:
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py pair-derivation
 ```
 
 Each check starts a temporary HTTP server, generates media bytes in memory,

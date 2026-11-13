@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..errors import PlanInvalid
@@ -16,6 +16,8 @@ from ..validation import (
 
 
 MAX_OPERATIONS = 12
+PAIR_INTERVAL_MIN_SECONDS = 0.001
+PAIR_INTERVAL_MAX_SECONDS = 600.0
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,32 @@ class CompiledPlan:
     operations: list[dict[str, Any]]
     digest: str
     operation_types: list[str]
+
+
+@dataclass(frozen=True)
+class CompiledPairPlan:
+    audio_operations: list[dict[str, Any]]
+    video_operations: list[dict[str, Any]]
+    digest: str
+    operation_types: list[str]
+
+
+@dataclass(frozen=True)
+class CompiledMemberPlan:
+    """A shared cut requested through one pair member.
+
+    ``trim`` is either ``{start_seconds, duration_seconds}`` for an audio
+    member or ``{start_frame, frame_count}`` for a video member.  Remaining
+    operations apply to the requesting member only.
+    """
+
+    media_kind: str
+    trim: dict[str, Any]
+    remaining_operations: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def operation_types(self) -> list[str]:
+        return [str(item["type"]) for item in self.remaining_operations]
 
 
 def _only_keys(operation: dict[str, Any], allowed: set[str], name: str) -> None:
@@ -202,7 +230,6 @@ def _operation_validator(
             "audio_gain": _audio_gain,
             "audio_normalize": _audio_normalize,
             "audio_mix": _audio_mix,
-            "video_crop": None,
         }
     else:
         validators = {
@@ -259,11 +286,196 @@ def compile_plan(
 
     return CompiledPlan(
         operations=normalized,
-        digest=digest_json(
-            {
-                "media_kind": media_kind,
-                "operations": normalized,
-            }
-        ),
+        digest=digest_json({"media_kind": media_kind, "operations": normalized}),
         operation_types=[item["type"] for item in normalized],
     )
+
+
+def compile_pair_plan(raw_plan: Any) -> CompiledPairPlan:
+    """Validate the audio and video operation lists of a new pair.
+
+    A pair plan carries no ``media_trim``: the declared sync points and shared
+    interval are the pairing mechanism, so an inline trim would silently
+    desynchronize a member.  ``audio_mix`` is also refused because a pair owns
+    exactly one audio source.
+    """
+
+    plan = require_object(raw_plan, "operations")
+    _only_keys(plan, {"audio", "video"}, "operations")
+    audio_operations = _pair_member_operations(
+        plan.get("audio"),
+        "audio",
+        "operations.audio",
+    )
+    video_operations = _pair_member_operations(
+        plan.get("video"),
+        "video",
+        "operations.video",
+    )
+    return CompiledPairPlan(
+        audio_operations=audio_operations,
+        video_operations=video_operations,
+        digest=digest_json({"audio": audio_operations, "video": video_operations}),
+        operation_types=[
+            *(f"audio:{item['type']}" for item in audio_operations),
+            *(f"video:{item['type']}" for item in video_operations),
+        ],
+    )
+
+
+def _pair_member_operations(
+    raw_operations: Any,
+    media_kind: str,
+    name: str,
+) -> list[dict[str, Any]]:
+    if raw_operations is None:
+        return []
+    if not isinstance(raw_operations, list):
+        raise PlanInvalid(f"{name} must be an array.")
+    if len(raw_operations) > MAX_OPERATIONS:
+        raise PlanInvalid(
+            f"{name} contains too many operations.",
+            details={"maximum": MAX_OPERATIONS},
+        )
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_operations):
+        operation = require_object(raw, f"{name}[{index}]")
+        operation_type = require_string(
+            operation.get("type"),
+            f"{name}[{index}].type",
+            maximum=64,
+        )
+        if operation_type == "media_trim":
+            raise PlanInvalid(
+                "Pair plans use the declared interval instead of media_trim.",
+                details={"index": index},
+            )
+        if operation_type == "audio_mix":
+            raise PlanInvalid("Pair plans do not accept a secondary mix source.")
+        validator = _operation_validator(operation_type, media_kind)
+        if validator is None:
+            raise PlanInvalid(
+                f"Operation {operation_type!r} is not valid for {media_kind} media.",
+                details={"index": index},
+            )
+        normalized.append(validator(operation))
+    return normalized
+
+
+def compile_member_plan(
+    media_kind: str,
+    raw_operations: Any,
+) -> CompiledMemberPlan:
+    """Validate a shared cut requested through an existing pair member.
+
+    The request must contain exactly one ``media_trim``; that trim defines the
+    common interval for both members.  Audio members name seconds, video
+    members name frames.  Other operations stay with the requesting member.
+    """
+
+    if media_kind not in {"audio", "video"}:
+        raise PlanInvalid("The member media kind is not supported.")
+    if not isinstance(raw_operations, list) or not raw_operations:
+        raise PlanInvalid("operations must be a non-empty array.")
+    trims: list[dict[str, Any]] = []
+    remaining_raw: list[Any] = []
+    for index, raw in enumerate(raw_operations):
+        operation = require_object(raw, f"operations[{index}]")
+        operation_type = require_string(
+            operation.get("type"),
+            f"operations[{index}].type",
+            maximum=64,
+        )
+        if operation_type == "media_trim":
+            trims.append(operation)
+        else:
+            remaining_raw.append(operation)
+    if not trims:
+        raise PlanInvalid(
+            "A pair member derivation must include exactly one media_trim."
+        )
+    if len(trims) > 1:
+        raise PlanInvalid("A pair member derivation accepts one media_trim.")
+
+    trim = trims[0]
+    if media_kind == "audio":
+        _only_keys(trim, {"type", "start_seconds", "duration_seconds"}, "media_trim")
+        normalized_trim = {
+            "start_seconds": require_number(
+                trim.get("start_seconds", 0.0),
+                "start_seconds",
+                minimum=0,
+                maximum=PAIR_INTERVAL_MAX_SECONDS,
+            ),
+            "duration_seconds": require_number(
+                trim.get("duration_seconds"),
+                "duration_seconds",
+                minimum=PAIR_INTERVAL_MIN_SECONDS,
+                maximum=PAIR_INTERVAL_MAX_SECONDS,
+            ),
+        }
+    else:
+        _only_keys(trim, {"type", "start_frame", "frame_count"}, "media_trim")
+        normalized_trim = {
+            "start_frame": require_integer(
+                trim.get("start_frame", 0),
+                "start_frame",
+                minimum=0,
+                maximum=239,
+            ),
+            "frame_count": require_integer(
+                trim.get("frame_count"),
+                "frame_count",
+                minimum=1,
+                maximum=240,
+            ),
+        }
+
+    remaining = _pair_member_operations(remaining_raw, media_kind, "operations")
+    return CompiledMemberPlan(
+        media_kind=media_kind,
+        trim=normalized_trim,
+        remaining_operations=remaining,
+    )
+
+
+def compile_interval(raw_interval: Any) -> dict[str, float]:
+    """Validate the caller-declared shared playback interval of a new pair."""
+
+    interval = require_object(raw_interval, "interval")
+    _only_keys(interval, {"start_seconds", "duration_seconds"}, "interval")
+    return {
+        "start_seconds": require_number(
+            interval.get("start_seconds", 0.0),
+            "interval.start_seconds",
+            minimum=0,
+            maximum=PAIR_INTERVAL_MAX_SECONDS,
+        ),
+        "duration_seconds": require_number(
+            interval.get("duration_seconds"),
+            "interval.duration_seconds",
+            minimum=PAIR_INTERVAL_MIN_SECONDS,
+            maximum=PAIR_INTERVAL_MAX_SECONDS,
+        ),
+    }
+
+
+def compile_sync(raw_sync: Any) -> dict[str, float]:
+    """Validate the declared alignment of the two sources at pair time zero."""
+
+    sync = require_object(raw_sync, "sync")
+    _only_keys(sync, {"audio_seconds", "video_seconds"}, "sync")
+    return {
+        "audio_seconds": require_number(
+            sync.get("audio_seconds", 0.0),
+            "sync.audio_seconds",
+            minimum=0,
+            maximum=PAIR_INTERVAL_MAX_SECONDS,
+        ),
+        "video_seconds": require_number(
+            sync.get("video_seconds", 0.0),
+            "sync.video_seconds",
+            minimum=0,
+            maximum=PAIR_INTERVAL_MAX_SECONDS,
+        ),
+    }

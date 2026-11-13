@@ -42,6 +42,38 @@ def trim_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
     return replace_channels(clip, (values[start:end] for values in clip.channels))
 
 
+def trim_audio_range(
+    clip: AudioClip,
+    start_sample: int,
+    sample_count: int,
+) -> AudioClip:
+    """Trim by already-quantized sample indices without re-rounding seconds.
+
+    Pair execution passes exact indices so a fractional sample rate boundary
+    is not rounded a second time and no accumulated drift is introduced.
+    """
+
+    start = int(start_sample)
+    count = int(sample_count)
+    if start < 0 or start >= clip.frame_count:
+        raise MediaOperationFailure(
+            "AUDIO_TRIM_OUT_OF_RANGE",
+            "The shared interval starts outside the audio source.",
+        )
+    if count < 1:
+        raise MediaOperationFailure(
+            "AUDIO_TRIM_EMPTY",
+            "The shared interval produces no audio sample frames.",
+        )
+    end = min(clip.frame_count, start + count)
+    if end <= start:
+        raise MediaOperationFailure(
+            "AUDIO_TRIM_EMPTY",
+            "The shared interval produces no audio sample frames.",
+        )
+    return replace_channels(clip, (values[start:end] for values in clip.channels))
+
+
 def gain_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
     factor = _gain_factor(float(operation["db"]))
     return replace_channels(
@@ -106,13 +138,11 @@ def mix_audio(
     return replace_channels(primary, mixed)
 
 
-def render_audio(
-    primary_bytes: bytes,
+def apply_audio_operations(
+    clip: AudioClip,
     operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
-) -> bytes:
-    clip = decode_wav(primary_bytes)
-    secondary = decode_wav(secondary_bytes) if secondary_bytes is not None else None
+    secondary: AudioClip | None = None,
+) -> AudioClip:
     mixed = False
 
     try:
@@ -147,5 +177,14 @@ def render_audio(
             "AUDIO_OPERATION_INVALID",
             "The audio operation payload is malformed.",
         ) from exc
+    return clip
 
-    return encode_wav(clip)
+
+def render_audio(
+    primary_bytes: bytes,
+    operations: list[dict[str, Any]],
+    secondary_bytes: bytes | None,
+) -> bytes:
+    clip = decode_wav(primary_bytes)
+    secondary = decode_wav(secondary_bytes) if secondary_bytes is not None else None
+    return encode_wav(apply_audio_operations(clip, operations, secondary))

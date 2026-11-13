@@ -393,6 +393,273 @@ def run_verify_reproduction(
     }
 
 
+def run_pair_derivation(
+    client: HTTPClient,
+    server: ProvenanceHTTPServer,
+) -> dict[str, Any]:
+    from fractions import Fraction
+
+    # A fractional frame rate makes any accumulated rounding visible.
+    audio_bytes = make_wav(
+        frequency=440,
+        duration_seconds=9.0,
+        sample_rate=8000,
+    )
+    video_bytes = make_y4m(
+        frame_count=240,
+        rate_numerator=240,
+        rate_denominator=7,
+    )
+    audio_asset = client.upload("pair-source.wav", audio_bytes)
+    video_asset = client.upload("pair-source.y4m", video_bytes)
+
+    pair_status, pair = client.request(
+        "POST",
+        "/v1/pairs",
+        {
+            "audio_asset_id": audio_asset["id"],
+            "video_asset_id": video_asset["id"],
+            "audio_output_name": "pair-output.wav",
+            "video_output_name": "pair-output.y4m",
+            "sync": {"audio_seconds": 0.0, "video_seconds": 0.0},
+            "interval": {"start_seconds": 0.001, "duration_seconds": 0.5},
+            "operations": {
+                "audio": [{"type": "audio_gain", "db": -3}],
+                "video": [{"type": "video_luma_offset", "amount": 7}],
+            },
+        },
+    )
+    require_equal(pair_status, 201, "pair creation status")
+    require_equal(pair["status"], "completed", "pair status")
+    require(
+        pair["audio_output_asset"]["kind"] == "audio"
+        and pair["video_output_asset"]["kind"] == "video",
+        "pair did not expose both media kinds",
+    )
+    for role in ("audio", "video"):
+        rendition = pair[f"{role}_rendition"]
+        require_equal(
+            [item["to"] for item in rendition["transitions"]],
+            ["queued", "running", "completed"],
+            f"{role} rendition history",
+        )
+        require_equal(rendition["pair_role"], role, f"{role} pair role")
+        require_equal(rendition["pair_id"], pair["id"], f"{role} pair id")
+
+    interval = pair["interval"]
+    for role in ("audio", "video"):
+        require_equal(
+            interval["members"][role]["start_seconds"],
+            interval["start_seconds"],
+            f"{role} member start matches shared start",
+        )
+        require_equal(
+            interval["members"][role]["duration_seconds"],
+            interval["duration_seconds"],
+            f"{role} member duration matches shared duration",
+        )
+    require_equal(
+        interval["timeline"]["exact"]["audio_requested"],
+        interval["timeline"]["exact"]["video_requested"],
+        "members share one requested position",
+    )
+
+    pair_read_status, fetched_pair = client.request("GET", f"/v1/pairs/{pair['id']}")
+    require_equal(pair_read_status, 200, "pair read status")
+    require_equal(fetched_pair["interval"], interval, "pair read interval")
+    member_read_status, pair_of_member = client.request(
+        "GET",
+        f"/v1/renditions/{pair['video_rendition_id']}/pair",
+    )
+    require_equal(member_read_status, 200, "rendition pair status")
+    require_equal(pair_of_member["id"], pair["id"], "rendition pair identity")
+
+    check_status, check = client.request(
+        "POST",
+        f"/v1/renditions/{pair['audio_rendition_id']}/integrity-checks",
+        {},
+    )
+    require_equal(check_status, 201, "pair integrity status")
+    require_equal(check["status"], "verified", "pair integrity result")
+    require_equal(len(check["members"]), 2, "pair integrity member count")
+    require(
+        all(item["status"] == "verified" for item in check["members"]),
+        "a pair member failed verification",
+    )
+
+    # Cutting through one member must move the counterpart too.
+    child_status, child = client.request(
+        "POST",
+        "/v1/renditions",
+        {
+            "primary_asset_id": pair["audio_output_asset"]["id"],
+            "output_name": "pair-child.wav",
+            "operations": [
+                {"type": "media_trim", "start_seconds": 0.05, "duration_seconds": 0.4},
+                {"type": "audio_gain", "db": -2},
+            ],
+        },
+    )
+    require_equal(child_status, 201, "child pair status")
+    require_equal(child["parent_pair_id"], pair["id"], "child parent pair")
+    child_video_frames = child["video_output_asset"]["descriptor"]["properties"][
+        "frame_count"
+    ]
+    require(
+        child_video_frames < 96,
+        f"counterpart video did not advance: {child_video_frames} frames",
+    )
+    require_equal(
+        child["video_rendition"]["operations"],
+        [],
+        "counterpart member inherited the requesting member's operations",
+    )
+
+    # Each child keeps only the requested sub-interval, so repeated cuts use
+    # a shrinking window: offset + duration must stay inside the parent.
+    current = child
+    generations = [current]
+    durations = [0.2, 0.1, 0.05, 0.02, 0.01]
+    for index, duration in enumerate(durations):
+        status, nxt = client.request(
+            "POST",
+            "/v1/renditions",
+            {
+                "primary_asset_id": current["audio_output_asset"]["id"],
+                "output_name": f"pair-step-{index}.wav",
+                "operations": [
+                    {"type": "media_trim", "start_seconds": 0.004, "duration_seconds": duration}
+                ],
+            },
+        )
+        require_equal(status, 201, f"repeated cut {index} status")
+        current = nxt
+        generations.append(current)
+
+    final = generations[-1]["interval"]
+    timeline = final["timeline"]
+    audio_drift = Fraction(final["exact"]["audio_requested_seconds"]) - Fraction(
+        timeline["exact"]["audio_delivered"]
+    )
+    video_drift = Fraction(final["exact"]["video_requested_seconds"]) - Fraction(
+        timeline["exact"]["video_delivered"]
+    )
+    require(
+        abs(audio_drift) <= Fraction(1, 2 * 8000),
+        f"audio drift exceeded half a sample: {float(audio_drift)}",
+    )
+    require(
+        abs(video_drift) <= Fraction(7, 240),
+        f"video drift exceeded one frame: {float(video_drift)}",
+    )
+    relative_drift = abs(audio_drift - video_drift)
+    require(
+        relative_drift <= Fraction(7, 240),
+        f"relative drift exceeded one frame: {float(relative_drift)}",
+    )
+    # The bounded drift must not grow with the number of cuts: the first and
+    # last deliveries are held to the same limit.
+    first = generations[0]["interval"]["timeline"]
+    first_audio_drift = Fraction(
+        generations[0]["interval"]["exact"]["audio_requested_seconds"]
+    ) - Fraction(first["exact"]["audio_delivered"])
+    first_video_drift = Fraction(
+        generations[0]["interval"]["exact"]["video_requested_seconds"]
+    ) - Fraction(first["exact"]["video_delivered"])
+    require(
+        abs(first_video_drift) <= Fraction(7, 240),
+        f"first delivery video drift exceeded one frame: {float(first_video_drift)}",
+    )
+    require(
+        abs(audio_drift) <= Fraction(7, 240) + abs(first_audio_drift),
+        "audio drift grew beyond its bound across cuts",
+    )
+
+    tree_status, tree_check = client.request(
+        "POST",
+        f"/v1/renditions/{generations[-1]['audio_rendition_id']}/integrity-checks",
+        {},
+    )
+    require_equal(tree_status, 201, "repeated cut integrity status")
+    require_equal(tree_check["status"], "verified", "repeated cut integrity result")
+
+    # A failed pair must leave both members failed and expose no delivery.
+    failure_status, failure_body = client.request(
+        "POST",
+        "/v1/pairs",
+        {
+            "audio_asset_id": audio_asset["id"],
+            "video_asset_id": video_asset["id"],
+            "audio_output_name": "broken.wav",
+            "video_output_name": "broken.y4m",
+            "sync": {"audio_seconds": 0.0, "video_seconds": 0.0},
+            "interval": {"start_seconds": 0.0, "duration_seconds": 0.5},
+            "operations": {
+                "audio": [],
+                "video": [
+                    {"type": "video_crop", "x": 0, "y": 0, "width": 66, "height": 36}
+                ],
+            },
+        },
+    )
+    require_equal(failure_status, 409, "failed pair status")
+    require_equal(
+        failure_body["error"]["code"],
+        "RENDER_FAILED",
+        "failed pair error code",
+    )
+    state = server.application.state_file.read()
+    failed = [
+        record
+        for record in state["renditions"].values()
+        if record["output_name"] in {"broken.wav", "broken.y4m"}
+    ]
+    require_equal(len(failed), 2, "failed pair member count")
+    require(
+        all(record["status"] == "failed" for record in failed),
+        "a failed pair left a successful member",
+    )
+    require(
+        all(record["output_asset_id"] is None for record in failed),
+        "a failed pair exposed an output asset",
+    )
+    require(
+        failed[0]["pair_id"] not in state["pairs"]
+        or failed[1]["pair_id"] not in state["pairs"],
+        "a failed pair was exposed despite missing outputs",
+    )
+    require(
+        not any(
+            asset["filename"] in {"broken.wav", "broken.y4m"}
+            for asset in state["assets"].values()
+        ),
+        "a failed pair exposed an output asset record",
+    )
+
+    # Ordinary single-media trimming must keep working unchanged.
+    standalone = client.create_rendition(
+        {
+            "primary_asset_id": audio_asset["id"],
+            "output_name": "standalone.wav",
+            "operations": [
+                {"type": "media_trim", "start_seconds": 0.1, "duration_seconds": 0.2}
+            ],
+        }
+    )
+    require_equal(standalone["status"], "completed", "standalone status")
+    require(standalone.get("pair_id") is None, "single-media rendition joined a pair")
+    return {
+        "workflow": "pair-derivation",
+        "pair_id": pair["id"],
+        "generations": len(generations),
+        "audio_drift_seconds": float(audio_drift),
+        "video_drift_seconds": float(video_drift),
+        "relative_drift_seconds": float(relative_drift),
+        "failed_pair_code": failure_body["error"]["code"],
+        "standalone_pair_id": standalone.get("pair_id"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -401,6 +668,7 @@ def main() -> int:
             "ingest-media-asset",
             "execute-rendition",
             "verify-reproduction",
+            "pair-derivation",
         ),
     )
     args = parser.parse_args()
@@ -410,6 +678,8 @@ def main() -> int:
             result = run_ingest_media_asset(client)
         elif args.workflow == "execute-rendition":
             result = run_execute_rendition(client)
+        elif args.workflow == "pair-derivation":
+            result = run_pair_derivation(client, server)
         else:
             result = run_verify_reproduction(client, server)
     print(json.dumps(result, sort_keys=True))
